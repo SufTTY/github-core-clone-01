@@ -276,11 +276,11 @@ function handleRepoRoute(store: Store, repo: Repo, segments: readonly string[], 
   }
 
   if (head === 'issues') {
-    return handleIssues(store, repo, rest, method, url, rawBody);
+    return handleIssues(store, repo, rest, method, url, rawBody, origin);
   }
 
   if (head === 'pulls') {
-    return handlePulls(store, repo, rest, method, url, rawBody);
+    return handlePulls(store, repo, rest, method, url, rawBody, origin);
   }
 
   if (head === 'contents') {
@@ -306,7 +306,7 @@ function isoOf(ident: string): string {
 
 // ---------------------------------------------------------------- issues
 
-function handleIssues(store: Store, repo: Repo, segments: readonly string[], method: string, url: URL, rawBody: string | undefined): Reply {
+function handleIssues(store: Store, repo: Repo, segments: readonly string[], method: string, url: URL, rawBody: string | undefined, origin = ''): Reply {
   if (segments.length === 0 && method === 'GET') {
     const state = url.searchParams.get('state') ?? 'open';
     const direction = url.searchParams.get('direction') ?? 'desc';
@@ -381,7 +381,7 @@ function handleIssues(store: Store, repo: Repo, segments: readonly string[], met
 
 // ---------------------------------------------------------------- pulls
 
-function handlePulls(store: Store, repo: Repo, segments: readonly string[], method: string, url: URL, rawBody: string | undefined): Reply {
+function handlePulls(store: Store, repo: Repo, segments: readonly string[], method: string, url: URL, rawBody: string | undefined, origin = ''): Reply {
   if (segments.length === 0 && method === 'GET') {
     const state = url.searchParams.get('state') ?? 'open';
     const pulls = [...repo.pulls.values()]

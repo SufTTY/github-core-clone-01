@@ -33,8 +33,8 @@ function pktLines(items: ReadonlyArray<string | typeof PKT_FLUSH>): Buffer {
 
 function sideband(payload: Buffer): Buffer {
   const parts: Buffer[] = [];
-  for (let offset = 0; offset < payload.length; offset += 65519) {
-    const chunk = payload.subarray(offset, offset + 65519);
+  for (let offset = 0; offset < payload.length; offset += 65515) {
+    const chunk = payload.subarray(offset, offset + 65515);
     const frame = Buffer.allocUnsafe(chunk.length + 5);
     frame.write((chunk.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
     frame[4] = 1;
@@ -117,8 +117,17 @@ function reachableObjects(store: Store, ctx: Ctx, tips: readonly string[], bound
   };
   const walkCommit = (oid: string, depth: number): void => {
     if (seen.has(oid) || boundaries.has(oid) || exclude.has(oid)) return;
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') return;
+    let object = repo.objects.get(oid);
+    if (!object) return;
+    if (object.type === 'tag') {
+      // An annotated tag travels with its target.
+      seen.add(oid);
+      out.push(object);
+      const target = object.data.toString('utf8').match(/^object ([0-9a-f]{40})/m);
+      if (target) walkCommit(target[1] as string, depth);
+      return;
+    }
+    if (object.type !== 'commit') return;
     seen.add(oid);
     out.push(object);
     const view = parseCommit(object.data);
@@ -162,7 +171,15 @@ function shallowObjects(store: Store, ctx: Ctx, tips: readonly string[], depth: 
   const walkCommit = (oid: string, remaining: number): void => {
     if (seen.has(oid)) return;
     const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') return;
+    if (!object) return;
+    if (object.type === 'tag') {
+      seen.add(oid);
+      objects.push(object);
+      const target = object.data.toString('utf8').match(/^object ([0-9a-f]{40})/m);
+      if (target) walkCommit(target[1] as string, remaining);
+      return;
+    }
+    if (object.type !== 'commit') return;
     seen.add(oid);
     objects.push(object);
     const view = parseCommit(object.data);
@@ -190,22 +207,28 @@ function handleUploadPackV2(store: Store, ctx: Ctx, body: Buffer): Reply {
     if (line.startsWith('command=')) command = line.slice('command='.length);
     if (line === 'flush') break;
   }
-  if (command === 'ls-refs') return lsRefsV2(repo);
+  if (command === 'ls-refs') {
+    const prefixes = lines.filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice('ref-prefix '.length).trim()).filter((prefix) => prefix !== '');
+    return lsRefsV2(repo, prefixes);
+  }
   if (command === 'fetch') return fetchV2(store, ctx, lines);
   // Unknown command: an empty response after the command section.
   return { status: 200, contentType: 'application/x-git-upload-pack-result', body: PKT_FLUSH };
 }
 
-function lsRefsV2(repo: NonNullable<ReturnType<Store['getRepo']>>): Reply {
+function lsRefsV2(repo: NonNullable<ReturnType<Store['getRepo']>>, prefixes: readonly string[] = []): Reply {
   const parts: Buffer[] = [];
+  const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   const headOid = resolveRef(repo, 'HEAD');
-  if (headOid) parts.push(encodePktLine(`${headOid} HEAD symref-target:refs/heads/${repo.default_branch}\n`));
-  else parts.push(encodePktLine(`unborn refs/heads/${repo.default_branch} symref-target:refs/heads/${repo.default_branch}\n`));
-  for (const [name, oid] of repo.refs) {
-    if (name.startsWith('refs/heads/')) parts.push(encodePktLine(`${oid} ${name}\n`));
+  if (keep('HEAD')) {
+    if (headOid) parts.push(encodePktLine(`${headOid} HEAD symref-target:refs/heads/${repo.default_branch}\n`));
+    else parts.push(encodePktLine(`unborn HEAD symref-target:refs/heads/${repo.default_branch}\n`));
   }
   for (const [name, oid] of repo.refs) {
-    if (name.startsWith('refs/tags/')) {
+    if (name.startsWith('refs/heads/') && keep(name)) parts.push(encodePktLine(`${oid} ${name}\n`));
+  }
+  for (const [name, oid] of repo.refs) {
+    if (name.startsWith('refs/tags/') && keep(name)) {
       const object = repo.objects.get(oid);
       if (object && object.type === 'tag') {
         const match = object.data.toString('utf8').match(/^object ([0-9a-f]{40})/m);
@@ -381,6 +404,24 @@ function handleUploadPackV0(store: Store, ctx: Ctx, body: Buffer): Reply {
 
 // ---------------------------------------------------------------- receive-pack
 
+/** Whether `newOid` descends from `oldOid` (a bounded commit walk, so a push cannot loop the server). */
+function isFastForward(repo: NonNullable<ReturnType<Store['getRepo']>>, oldOid: string, newOid: string): boolean {
+  if (oldOid === newOid) return true;
+  const seen = new Set<string>();
+  const queue: string[] = [newOid];
+  for (let visited = 0; queue.length > 0 && visited < 100_000; visited += 1) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    if (oid === oldOid) return true;
+    const object = repo.objects.get(oid);
+    if (!object || object.type !== 'commit') continue;
+    const view = parseCommit(object.data);
+    queue.push(...view.parents);
+  }
+  return false;
+}
+
 function handleReceivePack(store: Store, ctx: Ctx, body: Buffer): Reply {
   const repo = store.getRepo(ctx.owner, ctx.repo);
   if (!repo) return { status: 404, contentType: 'application/json', body: JSON.stringify({ message: 'Not Found' }) };
@@ -439,7 +480,7 @@ function handleReceivePack(store: Store, ctx: Ctx, body: Buffer): Reply {
         report.push(`ok ${command.ref}\n`);
         continue;
       }
-      if (current !== command.oldOid || !repo.objects.has(command.newOid)) {
+      if (current !== command.oldOid || !repo.objects.has(command.newOid) || !isFastForward(repo, command.oldOid, command.newOid)) {
         report.push(`ng ${command.ref} non-fast-forward\n`);
         continue;
       }

@@ -57,8 +57,10 @@ export interface Repo {
   created_at: string;
 }
 
-export const VIEWER_LOGIN = 'octocat-forge';
-export const STRANGER_LOGIN = 'not-the-owner';
+import { VIEWER as SCENARIO_VIEWER, STRANGER as SCENARIO_STRANGER } from './scenario.ts';
+
+export const VIEWER_LOGIN = SCENARIO_VIEWER.login;
+export const STRANGER_LOGIN = SCENARIO_STRANGER.login;
 
 export class Store {
   repos = new Map<string, Repo>(); // key `${owner}/${name}` (owner is always the viewer here)

@@ -179,7 +179,10 @@ class Parser {
       this.take('}');
       return { kind: 'object', fields };
     }
-    const token = this.name();
+    if (!/[_A-Za-z0-9-]/.test(ch)) throw new GqlError(`expected a value at offset ${this.pos}`);
+    const match = /^-?[_0-9A-Za-z.]+/.exec(this.text.slice(this.pos));
+    const token = match ? match[0] : this.name();
+    this.pos += token.length;
     if (token === 'true') return { kind: 'bool', value: true };
     if (token === 'false') return { kind: 'bool', value: false };
     if (token === 'null') return { kind: 'null' };

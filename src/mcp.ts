@@ -4,6 +4,8 @@ import { Store, VIEWER_LOGIN, refCommit, dateFromSeq, squashMerge, type Repo, ty
 import { globalId } from './rest.ts';
 import { pullFiles } from './store.ts';
 
+const SERVER_INFO = { name: 'forge-github', title: 'Forge GitHub-compatible server', version: '1.0.0' };
+
 const SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 
 interface ToolDef {
@@ -148,7 +150,7 @@ export function handleMcp(store: Store, rawBody: string | undefined, authed: boo
         protocolVersion: '2026-07-28',
         supportedVersions: SUPPORTED_VERSIONS,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'forge-github', title: 'Forge GitHub-compatible server', version: '1.0.0' },
+        serverInfo: SERVER_INFO,
       }),
       contentType: 'application/json',
     };
@@ -156,7 +158,12 @@ export function handleMcp(store: Store, rawBody: string | undefined, authed: boo
   if (method === 'server/discover') {
     return {
       status: 200,
-      body: rpcResult(id, { supportedVersions: SUPPORTED_VERSIONS, capabilities: { tools: {} } }),
+      body: rpcResult(id, {
+        supportedVersions: SUPPORTED_VERSIONS,
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: SERVER_INFO,
+        _meta: { 'io.modelcontextprotocol/serverInfo': SERVER_INFO },
+      }),
       contentType: 'application/json',
     };
   }
@@ -208,7 +215,9 @@ function textResult(payload: unknown): Record<string, unknown> {
 function callTool(store: Store, name: string, context: { owner: string; repo: string; arguments_: Record<string, unknown> }): Record<string, unknown> {
   const { owner, repo: repoName, arguments_ } = context;
   if (name === 'create_repo') {
-    const created = store.createRepo(repoName, String(arguments_.description ?? ''), arguments_.private === true);
+    const chosen = String(arguments_.name ?? repoName ?? '');
+    if (chosen === '') throw new Error('Missing required argument(s): name');
+    const created = store.createRepo(chosen, String(arguments_.description ?? ''), arguments_.private === true);
     return textResult({ full_name: created.key, name: created.name, id: created.id, private: created.privateFlag, default_branch: created.default_branch });
   }
   const repo = store.getRepo(owner, repoName);
