@@ -65,6 +65,7 @@ function tokenOf(req: IncomingMessage): string | undefined {
 
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
+    req.socket.setNoDelay(true);
     void (async () => {
       let url: URL;
       try {
