@@ -88,6 +88,13 @@ async function main(): Promise<void> {
   });
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
+  // Keep-alive tuning for the benchmark's long-lived keep-alive connections: hold each socket open
+  // far beyond the bench's inter-request gaps (default 5 s would close idle sockets mid-workload),
+  // allow more time for headers on slow loopback, and turn Nagle off so small JSON replies are not
+  // delayed waiting for an ACK.
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+  server.on('connection', (socket) => socket.setNoDelay(true));
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
 
   await register(address.port);
