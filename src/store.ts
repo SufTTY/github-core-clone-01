@@ -243,7 +243,7 @@ export function diffCounts(oldText: string | null, newText: string | null): { ad
 /** Files changed between two commits (or unborn). */
 export function pullFiles(repo: Repo, baseCommit: string | undefined, headCommit: string | undefined): PullFile[] {
   const baseFiles = new Map(baseCommit ? flattenTree(repo, repo.objects.get(baseCommit)! ? parseCommit(repo.objects.get(baseCommit)!.data).tree : '').map((file) => [file.path, file]) : []);
-  const headFiles = new Map(headCommit ? flattenTree(repo, parseCommit(repo.objects.get(headCommit)!.data).tree).map((file) => [file.path, file]) : []);
+  const headFiles = new Map(headCommit ? flattenTree(repo, parseCommit(repo.objects.get(headCommit)!).data).tree : '').map((file) => [file.path, file]) : []);
   const paths = new Set([...baseFiles.keys(), ...headFiles.keys()]);
   const files: PullFile[] = [];
   for (const path of [...paths].sort()) {
