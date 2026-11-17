@@ -1,26 +1,28 @@
-// MCP over Streamable HTTP at /mcp: initialize, server/discover, tools/list, tools/call.
-// JSON-RPC 2.0, revision 2026-07-28 with older handshake revisions accepted.
-import { Store, VIEWER_LOGIN, refCommit, dateFromSeq, squashMerge, type Repo, type Issue, type Pull } from './store.ts';
+// Model Context Protocol endpoint at POST /mcp: JSON-RPC 2.0 over Streamable HTTP.
+// Revision 2026-07-28 (server/discover) is the current one; the initialize handshake
+// of 2025-11-25 and earlier still answers, and every reply is a single JSON body.
+import { Store, VIEWER_LOGIN, refCommit, dateFromSeq, squashMerge, type Issue, type Pull } from './store.ts';
 import { globalId } from './rest.ts';
-import { pullFiles } from './store.ts';
 
-const SERVER_INFO = { name: 'forge-github', title: 'Forge GitHub-compatible server', version: '1.0.0' };
+const IDENTITY = { name: 'forge-github', title: 'Forge GitHub-compatible server', version: '1.0.0' };
 
-const SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const REVISIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 
-interface ToolDef {
+const JSON_TYPE = 'application/json';
+
+interface ToolSpec {
   name: string;
-  description: string;
-  required: readonly string[];
-  properties: Record<string, Record<string, unknown>>;
+  blurb: string;
+  needs: readonly string[];
+  fields: Record<string, Record<string, unknown>>;
 }
 
-const TOOLS: readonly ToolDef[] = [
+const CATALOG: readonly ToolSpec[] = [
   {
     name: 'create_repo',
-    description: 'Create a new repository owned by the authenticated user.',
-    required: ['name'],
-    properties: {
+    blurb: 'Create a new repository owned by the authenticated user.',
+    needs: ['name'],
+    fields: {
       name: { type: 'string', description: 'The repository name' },
       description: { type: 'string', description: 'The repository description' },
       private: { type: 'boolean', description: 'Whether the repository is private' },
@@ -28,9 +30,9 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'get_repo',
-    description: 'Get details of one repository.',
-    required: ['owner', 'repo'],
-    properties: {
+    blurb: 'Get details of one repository.',
+    needs: ['owner', 'repo'],
+    fields: {
       owner: { type: 'string', description: 'The repository owner login' },
       repo: { type: 'string', description: 'The repository name' },
       full_name: { type: 'string', description: 'owner/repo combined' },
@@ -38,9 +40,9 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'create_issue',
-    description: 'Create a new issue in a repository.',
-    required: ['owner', 'repo', 'title'],
-    properties: {
+    blurb: 'Create a new issue in a repository.',
+    needs: ['owner', 'repo', 'title'],
+    fields: {
       owner: { type: 'string', description: 'The repository owner login' },
       repo: { type: 'string', description: 'The repository name' },
       full_name: { type: 'string', description: 'owner/repo combined' },
@@ -50,9 +52,9 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'list_issues',
-    description: 'List issues in a repository.',
-    required: ['owner', 'repo'],
-    properties: {
+    blurb: 'List issues in a repository.',
+    needs: ['owner', 'repo'],
+    fields: {
       owner: { type: 'string', description: 'The repository owner login' },
       repo: { type: 'string', description: 'The repository name' },
       full_name: { type: 'string', description: 'owner/repo combined' },
@@ -61,9 +63,9 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'create_pull_request',
-    description: 'Open a pull request from a pushed head branch.',
-    required: ['owner', 'repo', 'title', 'head', 'base'],
-    properties: {
+    blurb: 'Open a pull request from a pushed head branch.',
+    needs: ['owner', 'repo', 'title', 'head', 'base'],
+    fields: {
       owner: { type: 'string', description: 'The repository owner login' },
       repo: { type: 'string', description: 'The repository name' },
       full_name: { type: 'string', description: 'owner/repo combined' },
@@ -75,9 +77,9 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'merge_pull_request',
-    description: 'Merge a pull request (squash).',
-    required: ['owner', 'repo', 'pull_number'],
-    properties: {
+    blurb: 'Merge a pull request (squash).',
+    needs: ['owner', 'repo', 'pull_number'],
+    fields: {
       owner: { type: 'string', description: 'The repository owner login' },
       repo: { type: 'string', description: 'The repository name' },
       full_name: { type: 'string', description: 'owner/repo combined' },
@@ -87,192 +89,188 @@ const TOOLS: readonly ToolDef[] = [
   },
 ];
 
-function toolsListJson(): string {
-  // Deterministic, so two tools/list calls answer byte for byte.
-  return JSON.stringify({
-    tools: TOOLS.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: { type: 'object', properties: tool.properties, required: [...tool.required] },
+function listToolsPayload(): Record<string, unknown> {
+  // The catalog never changes at runtime, so this payload is the same bytes every call.
+  return {
+    tools: CATALOG.map((spec) => ({
+      name: spec.name,
+      description: spec.blurb,
+      inputSchema: { type: 'object', properties: spec.fields, required: [...spec.needs] },
     })),
-  });
+  };
 }
 
-function rpcError(id: unknown, code: number, message: string): string {
-  return JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } });
+function failFrame(id: unknown, code: number, why: string): string {
+  return JSON.stringify({ jsonrpc: '2.0', id, error: { code, message: why } });
 }
-function rpcResult(id: unknown, result: unknown): string {
-  return JSON.stringify({ jsonrpc: '2.0', id, result });
+
+function okFrame(id: unknown, value: unknown): string {
+  return JSON.stringify({ jsonrpc: '2.0', id, result: value });
 }
 
 export interface McpReply { status: number; body: string; contentType: string }
 
-/** Split arguments: owner/repo may arrive as full_name, pull_number as pullNumber etc. */
-function pick(arguments_: Record<string, unknown>, names: readonly string[]): unknown {
-  for (const name of names) {
-    if (arguments_[name] !== undefined) return arguments_[name];
+function send(status: number, body: string): McpReply {
+  return { status, body, contentType: JSON_TYPE };
+}
+
+/** First defined value among the keys, so aliases such as repository still answer. */
+function firstDefined(bag: Record<string, unknown>, keys: readonly string[]): unknown {
+  for (const key of keys) {
+    if (bag[key] !== undefined) return bag[key];
   }
   return undefined;
 }
 
-function splitFullName(value: unknown): { owner?: string; repo?: string } {
+/** Split an "owner/repo" style value into its two halves. */
+function splitOwnerRepo(value: unknown): { owner?: string; repo?: string } {
   if (typeof value !== 'string') return {};
   const slash = value.indexOf('/');
   if (slash < 0) return { repo: value };
   return { owner: value.slice(0, slash), repo: value.slice(slash + 1) };
 }
 
+function textPayload(value: unknown): Record<string, unknown> {
+  return { content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }] };
+}
+
 export function handleMcp(store: Store, rawBody: string | undefined, authed: boolean, hasAuthHeader: boolean): McpReply {
   let message: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(rawBody ?? '');
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
-    message = parsed as Record<string, unknown>;
+    const decoded = JSON.parse(rawBody ?? '');
+    if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) throw new Error('not an object');
+    message = decoded as Record<string, unknown>;
   } catch {
-    return {
-      status: 400,
-      body: JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }),
-      contentType: 'application/json',
-    };
+    return send(400, failFrame(null, -32700, 'Parse error'));
   }
   const method = typeof message.method === 'string' ? message.method : '';
   const id = message.id;
-  const isNotification = id === undefined || id === null;
-  const arguments_ = (message.params !== null && typeof message.params === 'object' && !Array.isArray(message.params)
-    && message.params.arguments !== null && typeof (message.params as Record<string, unknown>).arguments === 'object'
-    ? (message.params as Record<string, unknown>).arguments
-    : undefined) as Record<string, unknown> | undefined;
+  const params = message.params !== null && typeof message.params === 'object' && !Array.isArray(message.params)
+    ? (message.params as Record<string, unknown>)
+    : {};
+  const args = params.arguments !== null && typeof params.arguments === 'object'
+    ? (params.arguments as Record<string, unknown>)
+    : undefined;
 
-  if (method === 'initialize') {
-    return {
-      status: 200,
-      body: rpcResult(id, {
-        protocolVersion: '2026-07-28',
-        supportedVersions: SUPPORTED_VERSIONS,
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: SERVER_INFO,
-      }),
-      contentType: 'application/json',
-    };
+  const routes: Array<[matches: (name: string) => boolean, answer: () => McpReply]> = [
+    [(name) => name === 'initialize', () => send(200, okFrame(id, {
+      protocolVersion: REVISIONS[0],
+      supportedVersions: REVISIONS,
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: IDENTITY,
+    }))],
+    [(name) => name === 'server/discover', () => send(200, okFrame(id, {
+      supportedVersions: REVISIONS,
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: IDENTITY,
+      _meta: { 'io.modelcontextprotocol/serverInfo': IDENTITY },
+    }))],
+    [(name) => name.startsWith('notifications/'), () => send(202, '')],
+    [(name) => name === 'ping', () => send(200, okFrame(id, {}))],
+    [(name) => name === 'tools/list', () => send(200, okFrame(id, listToolsPayload()))],
+    [(name) => name === 'tools/call', () => answerCall(store, id, params, args, authed)],
+  ];
+  for (const [matches, answer] of routes) {
+    if (matches(method)) return answer();
   }
-  if (method === 'server/discover') {
-    return {
-      status: 200,
-      body: rpcResult(id, {
-        supportedVersions: SUPPORTED_VERSIONS,
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: SERVER_INFO,
-        _meta: { 'io.modelcontextprotocol/serverInfo': SERVER_INFO },
-      }),
-      contentType: 'application/json',
-    };
-  }
-  if (method === 'notifications/initialized' || method.startsWith('notifications/')) {
-    return { status: 202, body: '', contentType: 'application/json' };
-  }
-  if (method === 'ping') {
-    return { status: 200, body: rpcResult(id, {}), contentType: 'application/json' };
-  }
-  if (method === 'tools/list') {
-    return { status: 200, body: rpcResult(id, JSON.parse(toolsListJson())), contentType: 'application/json' };
-  }
-  if (method === 'tools/call') {
-    if (!authed) return { status: 401, body: JSON.stringify({ message: 'Requires authentication' }), contentType: 'application/json' };
-    const name = (message.params as Record<string, unknown> | undefined)?.name;
-    if (typeof name !== 'string' || name === '') {
-      return { status: 200, body: rpcError(id, -32602, 'Invalid params: tool name is required'), contentType: 'application/json' };
-    }
-    const lower = name.toLowerCase();
-    const matched = TOOLS.find((tool) => lower === tool.name || lower.endsWith(`__${tool.name}`) || lower.endsWith(`_${tool.name}`) || lower.endsWith(`-${tool.name}`) || lower.endsWith(`/${tool.name}`));
-    if (!matched) {
-      return { status: 200, body: rpcError(id, -32602, `Unknown tool: ${name}`), contentType: 'application/json' };
-    }
-    const args = arguments_ ?? {};
-    const missing = matched.required.filter((required) => pick(args, [required]) === undefined && (required !== 'owner' && required !== 'repo' || splitFullName(args.full_name)[required === 'owner' ? 'owner' : 'repo'] === undefined));
-    if (missing.length > 0) {
-      return { status: 200, body: rpcResult(id, { content: [{ type: 'text', text: `Missing required argument(s): ${missing.join(', ')}` }], isError: true }), contentType: 'application/json' };
-    }
-    const fullName = args.full_name;
-    const split = splitFullName(fullName);
-    const owner = String(pick(args, ['owner']) ?? split.owner ?? VIEWER_LOGIN);
-    const repoName = String(pick(args, ['repo', 'repository']) ?? split.repo ?? '');
-    try {
-      const result = callTool(store, matched.name, { owner, repo: repoName, arguments_: args });
-      return { status: 200, body: rpcResult(id, result), contentType: 'application/json' };
-    } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      return { status: 200, body: rpcResult(id, { content: [{ type: 'text', text }], isError: true }), contentType: 'application/json' };
-    }
-  }
-  if (isNotification) return { status: 202, body: '', contentType: 'application/json' };
-  return { status: 200, body: rpcError(id, -32601, `Method not found: ${method}`), contentType: 'application/json' };
+  if (id === undefined || id === null) return send(202, '');
+  return send(200, failFrame(id, -32601, `Method not found: ${method}`));
 }
 
-function textResult(payload: unknown): Record<string, unknown> {
-  return { content: [{ type: 'text', text: typeof payload === 'string' ? payload : JSON.stringify(payload) }] };
+/** Answer one tools/call: auth first, then name matching, then the required arguments. */
+function answerCall(store: Store, id: unknown, params: Record<string, unknown>, args: Record<string, unknown> | undefined, authed: boolean): McpReply {
+  if (!authed) return send(401, JSON.stringify({ message: 'Requires authentication' }));
+  const wanted = params.name;
+  if (typeof wanted !== 'string' || wanted === '') {
+    return send(200, failFrame(id, -32602, 'Invalid params: tool name is required'));
+  }
+  const lowered = wanted.toLowerCase();
+  const marks = ['__', '_', '-', '/'];
+  const spec = CATALOG.find((tool) => lowered === tool.name || marks.some((mark) => lowered.endsWith(`${mark}${tool.name}`)));
+  if (spec === undefined) {
+    return send(200, failFrame(id, -32602, `Unknown tool: ${wanted}`));
+  }
+  const given = args ?? {};
+  const absent = spec.needs.filter(
+    (key) => firstDefined(given, [key]) === undefined && (key !== 'owner' && key !== 'repo' || splitOwnerRepo(given.full_name)[key] === undefined),
+  );
+  if (absent.length > 0) {
+    return send(200, okFrame(id, { content: [{ type: 'text', text: `Missing required argument(s): ${absent.join(', ')}` }], isError: true }));
+  }
+  const split = splitOwnerRepo(given.full_name);
+  const owner = String(firstDefined(given, ['owner']) ?? split.owner ?? VIEWER_LOGIN);
+  const repoName = String(firstDefined(given, ['repo', 'repository']) ?? split.repo ?? '');
+  try {
+    return send(200, okFrame(id, runTool(store, spec.name, owner, repoName, given)));
+  } catch (error) {
+    const why = error instanceof Error ? error.message : String(error);
+    return send(200, okFrame(id, { content: [{ type: 'text', text: why }], isError: true }));
+  }
 }
 
-function callTool(store: Store, name: string, context: { owner: string; repo: string; arguments_: Record<string, unknown> }): Record<string, unknown> {
-  const { owner, repo: repoName, arguments_ } = context;
-  if (name === 'create_repo') {
-    const chosen = String(arguments_.name ?? repoName ?? '');
-    if (chosen === '') throw new Error('Missing required argument(s): name');
-    const created = store.createRepo(chosen, String(arguments_.description ?? ''), arguments_.private === true);
-    return textResult({ full_name: created.key, name: created.name, id: created.id, private: created.privateFlag, default_branch: created.default_branch });
+/** Run one catalog tool against the store; a throw becomes an isError text result. */
+function runTool(store: Store, tool: string, owner: string, repoName: string, given: Record<string, unknown>): Record<string, unknown> {
+  if (tool === 'create_repo') {
+    const wanted = String(given.name ?? repoName ?? '');
+    if (wanted === '') throw new Error('Missing required argument(s): name');
+    const made = store.createRepo(wanted, String(given.description ?? ''), given.private === true);
+    return textPayload({ full_name: made.key, name: made.name, id: made.id, private: made.privateFlag, default_branch: made.default_branch });
   }
   const repo = store.getRepo(owner, repoName);
   if (!repo) throw new Error(`Repository ${owner}/${repoName} not found`);
-  if (name === 'get_repo') {
-    return textResult({ id: repo.id, node_id: globalId('Repository', repo.id), name: repo.name, full_name: repo.key, owner: { login: repo.owner }, default_branch: repo.default_branch, private: repo.privateFlag, description: repo.description });
-  }
-  if (name === 'create_issue') {
-    const title = String(arguments_.title ?? '');
-    if (!title) throw new Error('Missing required argument(s): title');
-    const now = dateFromSeq(store.nextId());
-    const issue: Issue = {
-      repoKey: repo.key, number: repo.nextIssue++, title, body: String(arguments_.body ?? ''),
-      state: 'open', labels: [], comments: [], seq: store.nextId(),
-      created_at: now, updated_at: now, closed_at: null, user: VIEWER_LOGIN,
-    };
-    repo.issues.set(issue.number, issue);
-    return textResult({ number: issue.number, id: globalId('Issue', `${repo.id}_${issue.number}`), title: issue.title, state: 'open', url: `/api/v3/repos/${repo.key}/issues/${issue.number}` });
-  }
-  if (name === 'list_issues') {
-    const state = String(arguments_.state ?? 'open');
-    const issues = [...repo.issues.values()]
-      .filter((issue) => state === 'all' || issue.state === state)
-      .map((issue) => ({ number: issue.number, title: issue.title, state: issue.state, body: issue.body, labels: issue.labels }));
-    return textResult(issues);
-  }
-  if (name === 'create_pull_request') {
-    const head = String(arguments_.head ?? arguments_.headRefName ?? '');
-    const base = String(arguments_.base ?? arguments_.baseRefName ?? '');
-    const title = String(arguments_.title ?? '');
-    const headSha = refCommit(repo, `refs/heads/${head}`);
-    const baseSha = refCommit(repo, `refs/heads/${base}`);
-    if (!headSha || !baseSha) throw new Error('Head or base branch does not exist');
-    const now = dateFromSeq(store.nextId());
-    const pull: Pull = {
-      repoKey: repo.key, number: repo.nextPull++, title, body: String(arguments_.body ?? ''),
-      head, base, headSha, baseSha, state: 'open', merged: false, merge_commit_sha: null,
-      merged_at: null, created_at: now, user: VIEWER_LOGIN,
-    };
-    repo.pulls.set(pull.number, pull);
-    return textResult({ number: pull.number, id: globalId('PullRequest', `${repo.id}_${pull.number}`), state: 'open', head: head, base: base, url: `/api/v3/repos/${repo.key}/pulls/${pull.number}` });
-  }
-  if (name === 'merge_pull_request') {
-    const number = Number(pick(arguments_, ['pull_number', 'pullNumber', 'number']));
-    const pull = repo.pulls.get(number);
-    if (!pull) throw new Error(`Pull request #${number} not found`);
-    if (pull.merged) throw new Error('Pull request is already merged');
-    const baseSha = refCommit(repo, `refs/heads/${pull.base}`);
-    if (!baseSha) throw new Error('Base branch is gone');
-    const mergeSha = squashMerge(repo, pull);
-    pull.state = 'closed';
-    pull.merged = true;
-    pull.merge_commit_sha = mergeSha;
-    pull.merged_at = dateFromSeq(store.nextId());
-    return textResult({ merged: true, sha: mergeSha, number: pull.number, message: 'Pull Request successfully merged' });
+  switch (tool) {
+    case 'get_repo':
+      return textPayload({ id: repo.id, node_id: globalId('Repository', repo.id), name: repo.name, full_name: repo.key, owner: { login: repo.owner }, default_branch: repo.default_branch, private: repo.privateFlag, description: repo.description });
+    case 'create_issue': {
+      const title = String(given.title ?? '');
+      if (!title) throw new Error('Missing required argument(s): title');
+      const now = dateFromSeq(store.nextId());
+      const opened: Issue = {
+        repoKey: repo.key, number: repo.nextIssue++, title, body: String(given.body ?? ''),
+        state: 'open', labels: [], comments: [], seq: store.nextId(),
+        created_at: now, updated_at: now, closed_at: null, user: VIEWER_LOGIN,
+      };
+      repo.issues.set(opened.number, opened);
+      return textPayload({ number: opened.number, id: globalId('Issue', `${repo.id}_${opened.number}`), title: opened.title, state: 'open', url: `/api/v3/repos/${repo.key}/issues/${opened.number}` });
+    }
+    case 'list_issues': {
+      const wanted = String(given.state ?? 'open');
+      return textPayload(
+        [...repo.issues.values()]
+          .filter((entry) => wanted === 'all' || entry.state === wanted)
+          .map((entry) => ({ number: entry.number, title: entry.title, state: entry.state, body: entry.body, labels: entry.labels })),
+      );
+    }
+    case 'create_pull_request': {
+      const head = String(given.head ?? given.headRefName ?? '');
+      const base = String(given.base ?? given.baseRefName ?? '');
+      const title = String(given.title ?? '');
+      const headSha = refCommit(repo, `refs/heads/${head}`);
+      const baseSha = refCommit(repo, `refs/heads/${base}`);
+      if (!headSha || !baseSha) throw new Error('Head or base branch does not exist');
+      const now = dateFromSeq(store.nextId());
+      const opened: Pull = {
+        repoKey: repo.key, number: repo.nextPull++, title, body: String(given.body ?? ''),
+        head, base, headSha, baseSha, state: 'open', merged: false, merge_commit_sha: null,
+        merged_at: null, created_at: now, user: VIEWER_LOGIN,
+      };
+      repo.pulls.set(opened.number, opened);
+      return textPayload({ number: opened.number, id: globalId('PullRequest', `${repo.id}_${opened.number}`), state: 'open', head: opened.head, base: opened.base, url: `/api/v3/repos/${repo.key}/pulls/${opened.number}` });
+    }
+    case 'merge_pull_request': {
+      const wanted = Number(firstDefined(given, ['pull_number', 'pullNumber', 'number']));
+      const target = repo.pulls.get(wanted);
+      if (!target) throw new Error(`Pull request #${wanted} not found`);
+      if (target.merged) throw new Error('Pull request is already merged');
+      const baseSha = refCommit(repo, `refs/heads/${target.base}`);
+      if (!baseSha) throw new Error('Base branch is gone');
+      const sha = squashMerge(repo, target);
+      target.state = 'closed';
+      target.merged = true;
+      target.merge_commit_sha = sha;
+      target.merged_at = dateFromSeq(store.nextId());
+      return textPayload({ merged: true, sha, number: target.number, message: 'Pull Request successfully merged' });
+    }
   }
   throw new Error('Unknown tool');
 }
