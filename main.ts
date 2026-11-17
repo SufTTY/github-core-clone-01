@@ -61,7 +61,7 @@ async function boot(): Promise<void> {
 
   await awaitCompletion();
   server.close();
-  process.stdout.write('[entry] done\n');
+  process.stdout.write('[entry] env reported done; shutting down\n');
 }
 
 /** POST the bound port until the env accepts it. 200 is the normal answer; 409 is fine too. */
