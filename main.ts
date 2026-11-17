@@ -32,9 +32,12 @@ const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
+/** The wait after `attempt` failed requests: full jitter over exponential backoff, capped. */
 function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+  const cap = Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+  // Full jitter spreads retries uniformly over [RETRY_INITIAL_MS, cap] so a burst of entries that
+  // all failed together do not re-synchronize and hammer the env on the next attempt.
+  return Math.floor(RETRY_INITIAL_MS + Math.random() * (cap - RETRY_INITIAL_MS));
 }
 
 /**

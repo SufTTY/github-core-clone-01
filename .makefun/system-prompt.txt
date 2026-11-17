@@ -1,0 +1,1 @@
+withheld: the cloud Hermes desktop harness does not expose its system prompt file to the agent session
