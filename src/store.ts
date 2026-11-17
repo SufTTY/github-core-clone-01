@@ -55,6 +55,8 @@ export interface Repo {
   nextCommentId: number;
   seq: number;
   created_at: string;
+  /** Bumped on every ref change; the git reply cache in githttp.ts invalidates on it. */
+  refsVersion: number;
 }
 
 import { VIEWER as SCENARIO_VIEWER, STRANGER as SCENARIO_STRANGER } from './scenario.ts';
@@ -77,7 +79,7 @@ export class Store {
       key, name, owner: VIEWER_LOGIN, description, privateFlag, default_branch: 'main',
       id: this.nextId(), objects: new Map(), refs: new Map(), labels: new Map(),
       issues: new Map(), pulls: new Map(), nextIssue: 1, nextPull: 1, nextCommentId: 1,
-      seq, created_at: dateFromSeq(seq),
+      seq, created_at: dateFromSeq(seq), refsVersion: 0,
     };
     this.repos.set(key, repo);
     return repo;
@@ -290,6 +292,7 @@ export function squashMerge(repo: Repo, pull: Pull): string | null {
   const message = `${pull.title} (#${pull.number})\n\n${pull.body}`;
   const mergeCommit = putObject(repo, 'commit', buildCommit({ tree: headTree, parents: baseCommit ? [baseCommit] : [], message }));
   repo.refs.set(`refs/heads/${pull.base}`, mergeCommit);
+  repo.refsVersion += 1;
   return mergeCommit;
 }
 

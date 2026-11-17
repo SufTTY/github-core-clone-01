@@ -262,6 +262,7 @@ function handleRepoRoute(store: Store, repo: Repo, segments: readonly string[], 
     if (!repo.objects.has(sha)) return err(422, 'Validation Failed: object does not exist');
     if (repo.refs.has(refName)) return err(422, 'Reference already exists');
     repo.refs.set(refName, sha);
+    repo.refsVersion += 1;
     return reply(201, { ref: refName, node_id: globalId('GitRef', `${repo.id}_${refName}`), object: { sha, type: 'commit' }, url: `/api/v3/repos/${repo.owner}/${repo.name}/git/${refName}` });
   }
 
@@ -522,6 +523,7 @@ function handleContents(repo: Repo, segments: readonly string[], method: string,
     }
     const commitSha = commitChanges(repo, existingTip, { [path]: data }, message);
     repo.refs.set(`refs/heads/${branch}`, commitSha);
+    repo.refsVersion += 1;
     return reply(existingBlob !== null ? 200 : 201, {
       content: { sha: hashObject('blob', data), encoding: 'base64', name: path.split('/').pop(), path, size: data.length, type: 'file' },
       commit: { sha: commitSha, message, author: { name: VIEWER_LOGIN, email: 'forge@localhost', date: dateFromSeq(repo.id) }, html_url: `https://forge.local/${repo.owner}/${repo.name}/commit/${commitSha}` },
@@ -542,6 +544,7 @@ function handleContents(repo: Repo, segments: readonly string[], method: string,
     if (sha && sha !== existing.blob) return err(409, `${path} does not match ${sha}`);
     const commitSha = commitChanges(repo, tip, { [path]: null }, message);
     repo.refs.set(`refs/heads/${branch}`, commitSha);
+    repo.refsVersion += 1;
     return reply(200, { commit: { sha: commitSha, message } });
   }
 

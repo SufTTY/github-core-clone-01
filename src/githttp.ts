@@ -488,6 +488,7 @@ function handleReceivePack(store: Store, ctx: Ctx, body: Buffer): Reply {
       report.push(`ok ${command.ref}\n`);
     }
   }
+  repo.refsVersion += 1;
   // Build the sideband-framed report-status response.
   const reportBody = Buffer.concat(report.map((line) => encodePktLine(line)));
   const response = Buffer.concat([sideband(reportBody), PKT_FLUSH]);
@@ -496,7 +497,54 @@ function handleReceivePack(store: Store, ctx: Ctx, body: Buffer): Reply {
 
 // ---------------------------------------------------------------- router entry
 
+/**
+ * Reply cache for the git read paths (advertisements and upload-pack): their bytes depend only on
+ * the repository's objects and refs, so a per-repo cache keyed by the request and invalidated by
+ * the repo's refsVersion is safe. Receive-pack replies are never cached (bodies are unique and the
+ * side effects matter).
+ */
+const GIT_REPLY_CACHE_MAX = 128;
+const gitReplyCache = new Map<string, Map<string, { version: number; reply: Reply }>>();
+const v2AdvertisementCache = new Map<string, Reply>();
+
+function cachedGitReply(store: Store, ctx: Ctx, method: string, suffix: string, search: URLSearchParams, gitProtocol: string | null, body: Buffer): Reply {
+  const service = search.get('service');
+  const cacheable = (method === 'GET' && suffix === '/info/refs') || (method === 'POST' && suffix === '/git-upload-pack');
+  if (!cacheable) return handleGitRequestUncached(store, ctx, method, suffix, search, gitProtocol, body);
+  // The v2 capability advertisement is repo-independent; serve it from a tiny constant cache.
+  if (method === 'GET' && service === 'git-upload-pack' && gitProtocol === 'version=2') {
+    if (store.getRepo(ctx.owner, ctx.repo) === undefined) return handleGitRequestUncached(store, ctx, method, suffix, search, gitProtocol, body);
+    let hit = v2AdvertisementCache.get('v2');
+    if (hit === undefined) {
+      hit = handleGitRequestUncached(store, ctx, method, suffix, search, gitProtocol, body);
+      v2AdvertisementCache.set('v2', hit);
+    }
+    return hit;
+  }
+  const repo = store.getRepo(ctx.owner, ctx.repo);
+  const version = repo ? repo.refsVersion : -1;
+  let entries = gitReplyCache.get(ctx.repoKey);
+  if (entries === undefined) {
+    entries = new Map();
+    gitReplyCache.set(ctx.repoKey, entries);
+  }
+  const key = `${method}|${suffix}|${service ?? ''}|${gitProtocol ?? ''}|${body ? body.toString('latin1') : ''}`;
+  const hit = entries.get(key);
+  if (hit !== undefined && hit.version === version) return hit.reply;
+  const reply = handleGitRequestUncached(store, ctx, method, suffix, search, gitProtocol, body);
+  entries.set(key, { version, reply });
+  if (entries.size > GIT_REPLY_CACHE_MAX) {
+    const oldest = entries.keys().next().value;
+    if (oldest !== undefined) entries.delete(oldest);
+  }
+  return reply;
+}
+
 export function handleGitRequest(store: Store, ctx: Ctx, method: string, suffix: string, search: URLSearchParams, gitProtocol: string | null, body: Buffer): Reply {
+  return cachedGitReply(store, ctx, method, suffix, search, gitProtocol, body);
+}
+
+function handleGitRequestUncached(store: Store, ctx: Ctx, method: string, suffix: string, search: URLSearchParams, gitProtocol: string | null, body: Buffer): Reply {
   const service = search.get('service');
   if (method === 'GET' && suffix === '/info/refs') {
     if (service === 'git-upload-pack') {

@@ -66,15 +66,11 @@ function tokenOf(req: IncomingMessage): string | undefined {
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      let url: URL;
-      try {
-        url = new URL(req.url ?? '/', 'http://forge');
-      } catch {
-        send(res, 400, 'application/json; charset=utf-8', '{"message":"Problems parsing JSON"}');
-        return;
-      }
+      const rawUrl = req.url ?? '/';
+      const queryAt = rawUrl.indexOf('?');
+      const path = queryAt === -1 ? rawUrl : rawUrl.slice(0, queryAt);
+      const searchText = queryAt === -1 ? '' : rawUrl.slice(queryAt + 1);
       const method = req.method ?? 'GET';
-      const path = url.pathname;
       const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
       const presented = tokenOf(req);
       const authed = expectedToken === '' ? presented !== undefined : presented === expectedToken;
@@ -102,8 +98,16 @@ export function createApp(): Server {
           send(res, 401, 'application/json; charset=utf-8', '{"message":"Requires authentication"}', { 'www-authenticate': 'Basic realm="forge"' });
           return;
         }
-        const reply = handleGitRequest(store, git, method, suffix, url.searchParams, req.headers['git-protocol'] as string | null ?? null, body);
+        const reply = handleGitRequest(store, git, method, suffix, new URLSearchParams(searchText), req.headers['git-protocol'] as string | null ?? null, body);
         send(res, reply.status, reply.contentType, reply.body, reply.headers ?? {});
+        return;
+      }
+
+      let url: URL;
+      try {
+        url = new URL(rawUrl, 'http://forge');
+      } catch {
+        send(res, 400, 'application/json; charset=utf-8', '{"message":"Problems parsing JSON"}');
         return;
       }
 
